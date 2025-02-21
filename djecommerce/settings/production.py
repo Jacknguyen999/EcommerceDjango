@@ -19,6 +19,8 @@ DATABASES = {
         'HOST': config('DB_HOST'),
         'PORT': ''
     }
+    
+    
 }
 
 STRIPE_PUBLIC_KEY = config('STRIPE_LIVE_PUBLIC_KEY')

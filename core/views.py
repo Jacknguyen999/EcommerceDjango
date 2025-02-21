@@ -1,5 +1,7 @@
 import random
 import string
+import logging
+import traceback
 
 import stripe
 from django.conf import settings
@@ -13,15 +15,23 @@ from django.utils import timezone
 from django.views.generic import ListView, DetailView, View
 from django.shortcuts import render
 from django.db.models import Q
+from django.db import connections
+from django.db import transaction
+import cx_Oracle
+from django.contrib.auth.models import User
 
 from .forms import CheckoutForm, CouponForm, RefundForm, PaymentForm
-from .models import Item, OrderItem, Order, Address, Payment, Coupon, Refund, UserProfile
+from .models import Item, OrderItem, Order, Address, Payment, Coupon, Refund, UserProfile, OrderItems
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
-
-
-
+# Set up logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    filename='checkout.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 
 def create_ref_code():
@@ -77,278 +87,259 @@ class CheckoutView(View):
             messages.info(self.request, "You do not have an active order")
             return redirect("core:checkout")
 
-    def post(self, *args, **kwargs):
-        form = CheckoutForm(self.request.POST or None)
+    def post(self, request, *args, **kwargs):
+        form = CheckoutForm(request.POST or None)
         try:
-            order = Order.objects.get(user=self.request.user, ordered=False)
-            if form.is_valid():
+            # Log the raw POST data
+            logger.debug(f"Raw POST data: {request.POST}")
+            
+            # Check if the form is bound
+            logger.debug(f"Form is bound: {form.is_bound}")
+            logger.debug(f"Form data: {form.data}")
+            
+            if not form.is_valid():
+                logger.error(f"Form errors: {form.errors}")
+                for field, errors in form.errors.items():
+                    messages.error(request, f"{field}: {', '.join(errors)}")
+                return redirect("core:checkout")
+            
+            # Log cleaned data
+            logger.debug(f"Form cleaned data: {form.cleaned_data}")
+            
+            order = Order.objects.using('other_db').get(
+                user=request.user, 
+                ordered=False
+            )
 
-                use_default_shipping = form.cleaned_data.get(
-                    'use_default_shipping')
-                if use_default_shipping:
-                    print("Using the defualt shipping address")
-                    address_qs = Address.objects.filter(
-                        user=self.request.user,
-                        address_type='S',
-                        default=True
+            # Get shipping data
+            shipping_data = {
+                'address': form.cleaned_data.get('shipping_address'),
+                'country': form.cleaned_data.get('shipping_country'),
+                'zip': form.cleaned_data.get('shipping_zip')
+            }
+            logger.debug(f"Shipping data: {shipping_data}")
+
+            # Validate shipping data
+            if not all(shipping_data.values()):
+                missing = [k for k, v in shipping_data.items() if not v]
+                logger.error(f"Missing shipping fields: {missing}")
+                messages.error(request, f"Please fill in all required shipping fields: {', '.join(missing)}")
+                return redirect("core:checkout")
+
+            try:
+                shipping_address_obj = Address.objects.create(
+                    user=request.user,
+                    street_address=shipping_data['address'],
+                    apartment_address=form.cleaned_data.get('shipping_address2', ''),
+                    country=shipping_data['country'],
+                    zip=shipping_data['zip'],
+                    address_type='S'
+                )
+                logger.debug(f"Created shipping address: {shipping_address_obj.id}")
+            except Exception as e:
+                logger.error(f"Error creating shipping address: {str(e)}")
+                messages.error(request, f"Error creating shipping address: {str(e)}")
+                return redirect("core:checkout")
+
+            if form.cleaned_data.get('set_default_shipping'):
+                shipping_address_obj.default = True
+                shipping_address_obj.save()
+
+            # Handle billing address
+            same_billing_address = form.cleaned_data.get('same_billing_address')
+            logger.debug(f"Same billing address: {same_billing_address}")
+
+            if same_billing_address:
+                try:
+                    billing_address_obj = Address.objects.create(
+                        user=request.user,
+                        street_address=shipping_address_obj.street_address,
+                        apartment_address=shipping_address_obj.apartment_address,
+                        country=shipping_address_obj.country,
+                        zip=shipping_address_obj.zip,
+                        address_type='B'
                     )
-                    if address_qs.exists():
-                        shipping_address = address_qs[0]
-                        order.shipping_address = shipping_address
-                        order.save()
-                    else:
-                        messages.info(
-                            self.request, "No default shipping address available")
-                        return redirect('core:checkout')
-                else:
-                    print("User is entering a new shipping address")
-                    shipping_address1 = form.cleaned_data.get(
-                        'shipping_address')
-                    shipping_address2 = form.cleaned_data.get(
-                        'shipping_address2')
-                    shipping_country = form.cleaned_data.get(
-                        'shipping_country')
-                    shipping_zip = form.cleaned_data.get('shipping_zip')
+                    logger.debug(f"Created billing address (same as shipping): {billing_address_obj.id}")
+                except Exception as e:
+                    logger.error(f"Error creating billing address: {str(e)}")
+                    messages.error(request, f"Error creating billing address: {str(e)}")
+                    return redirect("core:checkout")
+            else:
+                billing_data = {
+                    'address': form.cleaned_data.get('billing_address'),
+                    'country': form.cleaned_data.get('billing_country'),
+                    'zip': form.cleaned_data.get('billing_zip')
+                }
+                logger.debug(f"Billing data: {billing_data}")
 
-                    if is_valid_form([shipping_address1, shipping_country, shipping_zip]):
-                        shipping_address = Address(
-                            user=self.request.user,
-                            street_address=shipping_address1,
-                            apartment_address=shipping_address2,
-                            country=shipping_country,
-                            zip=shipping_zip,
-                            address_type='S'
-                        )
-                        shipping_address.save()
+                if not all(billing_data.values()):
+                    missing = [k for k, v in billing_data.items() if not v]
+                    logger.error(f"Missing billing fields: {missing}")
+                    messages.error(request, f"Please fill in all required billing fields: {', '.join(missing)}")
+                    return redirect("core:checkout")
 
-                        order.shipping_address = shipping_address
-                        order.save()
-
-                        set_default_shipping = form.cleaned_data.get(
-                            'set_default_shipping')
-                        if set_default_shipping:
-                            shipping_address.default = True
-                            shipping_address.save()
-
-                    else:
-                        messages.info(
-                            self.request, "Please fill in the required shipping address fields")
-
-                use_default_billing = form.cleaned_data.get(
-                    'use_default_billing')
-                same_billing_address = form.cleaned_data.get(
-                    'same_billing_address')
-
-                if same_billing_address:
-                    billing_address = shipping_address
-                    billing_address.pk = None
-                    billing_address.save()
-                    billing_address.address_type = 'B'
-                    billing_address.save()
-                    order.billing_address = billing_address
-                    order.save()
-
-                elif use_default_billing:
-                    print("Using the defualt billing address")
-                    address_qs = Address.objects.filter(
-                        user=self.request.user,
-                        address_type='B',
-                        default=True
+                try:
+                    billing_address_obj = Address.objects.create(
+                        user=request.user,
+                        street_address=billing_data['address'],
+                        apartment_address=form.cleaned_data.get('billing_address2', ''),
+                        country=billing_data['country'],
+                        zip=billing_data['zip'],
+                        address_type='B'
                     )
-                    if address_qs.exists():
-                        billing_address = address_qs[0]
-                        order.billing_address = billing_address
-                        order.save()
-                    else:
-                        messages.info(
-                            self.request, "No default billing address available")
-                        return redirect('core:checkout')
-                else:
-                    print("User is entering a new billing address")
-                    billing_address1 = form.cleaned_data.get(
-                        'billing_address')
-                    billing_address2 = form.cleaned_data.get(
-                        'billing_address2')
-                    billing_country = form.cleaned_data.get(
-                        'billing_country')
-                    billing_zip = form.cleaned_data.get('billing_zip')
+                    logger.debug(f"Created billing address: {billing_address_obj.id}")
+                except Exception as e:
+                    logger.error(f"Error creating billing address: {str(e)}")
+                    messages.error(request, f"Error creating billing address: {str(e)}")
+                    return redirect("core:checkout")
 
-                    if is_valid_form([billing_address1, billing_country, billing_zip]):
-                        billing_address = Address(
-                            user=self.request.user,
-                            street_address=billing_address1,
-                            apartment_address=billing_address2,
-                            country=billing_country,
-                            zip=billing_zip,
-                            address_type='B'
-                        )
-                        billing_address.save()
+            if form.cleaned_data.get('set_default_billing'):
+                billing_address_obj.default = True
+                billing_address_obj.save()
 
-                        order.billing_address = billing_address
-                        order.save()
+            # Update order
+            try:
+                with transaction.atomic():
+                    with connections['other_db'].cursor() as cursor:
+                        # Convert IDs to integers and use a simpler SQL query
+                        shipping_id = int(shipping_address_obj.id)
+                        billing_id = int(billing_address_obj.id)
+                        order_id = int(order.id)
+                        
+                        cursor.execute("""
+                            UPDATE CORE_ORDER 
+                            SET SHIPPING_ADDRESS_ID = %s,
+                                BILLING_ADDRESS_ID = %s
+                            WHERE ID = %s
+                            """, [shipping_id, billing_id, order_id])
+                logger.debug(f"Order updated successfully with shipping_id={shipping_id}, billing_id={billing_id}, order_id={order_id}")
+            except Exception as e:
+                logger.error(f"Error updating order: {str(e)}")
+                logger.error(f"shipping_id={shipping_address_obj.id}, billing_id={billing_address_obj.id}, order_id={order.id}")
+                messages.error(request, f"Error updating order: {str(e)}")
+                return redirect("core:checkout")
 
-                        set_default_billing = form.cleaned_data.get(
-                            'set_default_billing')
-                        if set_default_billing:
-                            billing_address.default = True
-                            billing_address.save()
+            # Handle payment
+            payment_option = form.cleaned_data.get('payment_option')
+            logger.debug(f"Payment option: {payment_option}")
+            
+            if payment_option == 'S':
+                return redirect('core:payment', payment_option='stripe')
+            elif payment_option == 'P':
+                return redirect('core:payment', payment_option='paypal')
+            else:
+                logger.warning(f"Invalid payment option: {payment_option}")
+                messages.warning(request, "Invalid payment option")
+                return redirect('core:checkout')
 
-                    else:
-                        messages.info(
-                            self.request, "Please fill in the required billing address fields")
-
-                payment_option = form.cleaned_data.get('payment_option')
-
-                if payment_option == 'S':
-                    return redirect('core:payment', payment_option='stripe')
-                elif payment_option == 'P':
-                    return redirect('core:payment', payment_option='paypal')
-                else:
-                    messages.warning(
-                        self.request, "Invalid payment option selected")
-                    return redirect('core:checkout')
         except ObjectDoesNotExist:
-            messages.warning(self.request, "You do not have an active order")
+            logger.error("No active order found")
+            messages.error(request, "You do not have an active order")
             return redirect("core:order-summary")
+        except Exception as e:
+            logger.error(f"General error: {str(e)}")
+            logger.error(f"Error type: {type(e)}")
+            logger.error(f"Error location: {e.__traceback__.tb_lineno}")
+            messages.error(request, f"An error occurred: {str(e)}")
+            return redirect("core:checkout")
+
+        return redirect('core:checkout')
 
 
 class PaymentView(View):
     def get(self, *args, **kwargs):
-        order = Order.objects.get(user=self.request.user, ordered=False)
-        if order.billing_address:
+        order = Order.objects.using('other_db').get(user=self.request.user, ordered=False)
+        if order.billing_address_id:
             context = {
                 'order': order,
                 'DISPLAY_COUPON_FORM': False,
-                'STRIPE_PUBLIC_KEY' : settings.STRIPE_PUBLIC_KEY
+                'STRIPE_PUBLIC_KEY': settings.STRIPE_PUBLIC_KEY
             }
-            userprofile = self.request.user.userprofile
-            if userprofile.one_click_purchasing:
-                # fetch the users card list
-                cards = stripe.Customer.list_sources(
-                    userprofile.stripe_customer_id,
-                    limit=3,
-                    object='card'
-                )
-                card_list = cards['data']
-                if len(card_list) > 0:
-                    # update the context with the default card
-                    context.update({
-                        'card': card_list[0]
-                    })
             return render(self.request, "payment.html", context)
         else:
-            messages.warning(
-                self.request, "You have not added a billing address")
+            messages.warning(self.request, "You have not added a billing address")
             return redirect("core:checkout")
 
     def post(self, *args, **kwargs):
-        order = Order.objects.get(user=self.request.user, ordered=False)
-        form = PaymentForm(self.request.POST)
-        userprofile = UserProfile.objects.get(user=self.request.user)
-        if form.is_valid():
-            token = form.cleaned_data.get('stripeToken')
-            save = form.cleaned_data.get('save')
-            use_default = form.cleaned_data.get('use_default')
+        try:
+            order = Order.objects.using('other_db').get(user=self.request.user, ordered=False)
+            form = PaymentForm(self.request.POST)
+            userprofile = UserProfile.objects.using('default').get(user=self.request.user)
 
-            if save:
-                if userprofile.stripe_customer_id != '' and userprofile.stripe_customer_id is not None:
-                    customer = stripe.Customer.retrieve(
-                        userprofile.stripe_customer_id)
-                    customer.sources.create(source=token)
+            if form.is_valid():
+                token = form.cleaned_data.get('stripeToken')
+                save = form.cleaned_data.get('save')
+                use_default = form.cleaned_data.get('use_default')
 
-                else:
-                    customer = stripe.Customer.create(
-                        email=self.request.user.email,
-                    )
-                    customer.sources.create(source=token)
-                    userprofile.stripe_customer_id = customer['id']
-                    userprofile.one_click_purchasing = True
-                    userprofile.save()
+                if save:
+                    if userprofile.stripe_customer_id != '' and userprofile.stripe_customer_id is not None:
+                        customer = stripe.Customer.retrieve(userprofile.stripe_customer_id)
+                        customer.sources.create(source=token)
+                    else:
+                        customer = stripe.Customer.create(
+                            email=self.request.user.email,
+                            source=token
+                        )
+                        userprofile.stripe_customer_id = customer.id
+                        userprofile.save(using='default')
 
-            amount = int(order.get_total() * 100)
+                amount = int(order.get_total() * 100)  # cents
 
-            try:
-
-                if use_default or save:
-                    # charge the customer because we cannot charge the token more than once
+                try:
                     charge = stripe.Charge.create(
-                        amount=amount,  # cents
+                        amount=amount,
                         currency="usd",
-                        customer=userprofile.stripe_customer_id
-                    )
-                else:
-                    # charge once off on the token
-                    charge = stripe.Charge.create(
-                        amount=amount,  # cents
-                        currency="usd",
-                        source=token
+                        customer=userprofile.stripe_customer_id if use_default else None,
+                        source=token if not use_default else None
                     )
 
-                # create the payment
-                payment = Payment()
-                payment.stripe_charge_id = charge['id']
-                payment.user = self.request.user
-                payment.amount = order.get_total()
-                payment.save()
+                    # Create the payment
+                    payment = Payment.objects.using('other_db').create(
+                        stripe_charge_id=charge.id,
+                        user=self.request.user,
+                        amount=order.get_total()
+                    )
 
-                # assign the payment to the order
+                    # Update the order
+                    order_items = order.items.all()
+                    order_items.update(ordered=True)
+                    for item in order_items:
+                        item.save(using='other_db')
 
-                order_items = order.items.all()
-                order_items.update(ordered=True)
-                for item in order_items:
-                    item.save()
+                    order.ordered = True
+                    order.payment = payment
+                    order.ref_code = create_ref_code()
+                    order.save(using='other_db')
 
-                order.ordered = True
-                order.payment = payment
-                order.ref_code = create_ref_code()
-                order.save()
+                    messages.success(self.request, "Your order was successful!")
+                    return redirect("/")
 
-                messages.success(self.request, "Your order was successful!")
-                return redirect("/")
+                except stripe.error.CardError as e:
+                    messages.warning(self.request, f"{e.error.message}")
+                    return redirect("/")
+                except stripe.error.RateLimitError as e:
+                    messages.warning(self.request, "Rate limit error")
+                    return redirect("/")
+                except stripe.error.InvalidRequestError as e:
+                    messages.warning(self.request, "Invalid parameters")
+                    return redirect("/")
+                except stripe.error.AuthenticationError as e:
+                    messages.warning(self.request, "Not authenticated")
+                    return redirect("/")
+                except stripe.error.APIConnectionError as e:
+                    messages.warning(self.request, "Network error")
+                    return redirect("/")
+                except stripe.error.StripeError as e:
+                    messages.warning(self.request, "Something went wrong. You were not charged. Please try again.")
+                    return redirect("/")
+                except Exception as e:
+                    messages.warning(self.request, "A serious error occurred. We have been notified.")
+                    logger.error(f"Payment error: {str(e)}")
+                    return redirect("/")
 
-            except stripe.error.CardError as e:
-                body = e.json_body
-                err = body.get('error', {})
-                messages.warning(self.request, f"{err.get('message')}")
-                return redirect("/")
-
-            except stripe.error.RateLimitError as e:
-                # Too many requests made to the API too quickly
-                messages.warning(self.request, "Rate limit error")
-                return redirect("/")
-
-            except stripe.error.InvalidRequestError as e:
-                # Invalid parameters were supplied to Stripe's API
-                print(e)
-                messages.warning(self.request, "Invalid parameters")
-                return redirect("/")
-
-            except stripe.error.AuthenticationError as e:
-                # Authentication with Stripe's API failed
-                # (maybe you changed API keys recently)
-                messages.warning(self.request, "Not authenticated")
-                return redirect("/")
-
-            except stripe.error.APIConnectionError as e:
-                # Network communication with Stripe failed
-                messages.warning(self.request, "Network error")
-                return redirect("/")
-
-            except stripe.error.StripeError as e:
-                # Display a very generic error to the user, and maybe send
-                # yourself an email
-                messages.warning(
-                    self.request, "Something went wrong. You were not charged. Please try again.")
-                return redirect("/")
-
-            except Exception as e:
-                # send an email to ourselves
-                messages.warning(
-                    self.request, "A serious error occurred. We have been notifed.")
-                return redirect("/")
-
-        messages.warning(self.request, "Invalid data received")
-        return redirect("/payment/stripe/")
+        except ObjectDoesNotExist:
+            messages.warning(self.request, "You do not have an active order")
+            return redirect("/")
 
 
 # class HomeView(ListView):
@@ -399,90 +390,226 @@ class ItemDetailView(DetailView):
 
 @login_required
 def add_to_cart(request, slug):
-    item = get_object_or_404(Item, slug=slug)
-    order_item, created = OrderItem.objects.get_or_create(
-        item=item,
-        user=request.user,
-        ordered=False
-    )
-    order_qs = Order.objects.filter(user=request.user, ordered=False)
-    if order_qs.exists():
-        order = order_qs[0]
-        # check if the order item is in the order
-        if order.items.filter(item__slug=item.slug).exists():
-            order_item.quantity += 1
-            order_item.save()
-            messages.info(request, "This item quantity was updated.")
-            return redirect("core:order-summary")
+    try:
+        # Get item from MySQL database
+        item = get_object_or_404(Item.objects.using('item_db'), slug=slug)
+        logger.debug(f"Found item: {item}")
+        
+        # Get user from default database (SQLite)
+        user = get_object_or_404(User.objects.using('default'), id=request.user.id)
+        logger.debug(f"Found user: {user}")
+        
+        # Get or create order item in Oracle database
+        order_item, created = OrderItem.objects.using('other_db').get_or_create(
+            item_id=item.id,  # Use item_id instead of item
+            user_id=user.id,  # Use user_id instead of user
+            ordered=False,
+            defaults={'quantity': 1}
+        )
+        logger.debug(f"OrderItem created: {created}")
+        
+        # Get order queryset from Oracle database
+        order_qs = Order.objects.using('other_db').filter(
+            user_id=user.id,  # Use user_id instead of user
+            ordered=False
+        )
+        logger.debug(f"Found order: {order_qs.exists()}")
+        
+        if order_qs.exists():
+            order = order_qs[0]
+            # Check if the order item is in the order using the through model
+            if OrderItems.objects.using('other_db').filter(
+                order=order,
+                orderitem__item_id=item.id
+            ).exists():
+                order_item.quantity += 1
+                order_item.save(using='other_db')
+                messages.info(request, "This item quantity was updated.")
+            else:
+                OrderItems.objects.using('other_db').create(
+                    order=order,
+                    orderitem=order_item
+                )
+                messages.info(request, "This item was added to your cart.")
         else:
-            order.items.add(order_item)
+            ordered_date = timezone.now()
+            order = Order.objects.using('other_db').create(
+                user_id=user.id,  # Use user_id instead of user
+                ordered_date=ordered_date
+            )
+            OrderItems.objects.using('other_db').create(
+                order=order,
+                orderitem=order_item
+            )
             messages.info(request, "This item was added to your cart.")
-            return redirect("core:order-summary")
-    else:
-        ordered_date = timezone.now()
-        order = Order.objects.create(
-            user=request.user, ordered_date=ordered_date)
-        order.items.add(order_item)
-        messages.info(request, "This item was added to your cart.")
+        
         return redirect("core:order-summary")
+    except Exception as e:
+        logger.error(f"Error in add_to_cart: {str(e)}")
+        # Print the SQL query that caused the error
+        from django.db import connection
+        logger.error(f"Last query: {connection.queries[-1] if connection.queries else 'No queries'}")
+        raise
 
+
+# @login_required
+# def remove_from_cart(request, slug):
+#     item = get_object_or_404(Item, slug=slug)
+#     order_qs = Order.objects.using('other_db').filter(
+#         user=request.user,
+#         ordered=False
+#     )
+#     if order_qs.exists():
+#         order = order_qs[0]
+#         # check if the order item is in the order
+#         with connections['other_db'].cursor() as cursor:
+#             # Check if OrderItem exists
+#             cursor.execute("""
+#                 SELECT oi.ID 
+#                 FROM CORE_ORDERITEM oi
+#                 INNER JOIN CORE_ORDER_ITEMS coi ON oi.ID = coi.ORDERITEM_ID
+#                 WHERE coi.ORDER_ID = :1 
+#                 AND oi.ITEM_ID = :2
+#                 AND oi.ORDERED = 0
+#             """, [order.id, item.id])
+            
+#             order_item = cursor.fetchone()
+            
+#             if order_item:
+#                 order_item_id = order_item[0]
+#                 # First remove from CORE_ORDER_ITEMS
+#                 cursor.execute("""
+#                     DELETE FROM CORE_ORDER_ITEMS 
+#                     WHERE ORDER_ID = :1 AND ORDERITEM_ID = :2
+#                 """, [order.id, order_item_id])
+                
+#                 # Then delete the OrderItem
+#                 cursor.execute("""
+#                     DELETE FROM CORE_ORDERITEM 
+#                     WHERE ID = :1
+#                 """, [order_item_id])
+                
+#                 messages.info(request, "This item was removed from your cart.")
+#                 return redirect("core:order-summary")
+#             else:
+#                 messages.info(request, "This item was not in your cart")
+#                 return redirect("core:product", slug=slug)
+#     else:
+#         messages.info(request, "You do not have an active order")
+#         return redirect("core:product", slug=slug)
 
 @login_required
 def remove_from_cart(request, slug):
-    item = get_object_or_404(Item, slug=slug)
-    order_qs = Order.objects.filter(
-        user=request.user,
-        ordered=False
-    )
-    if order_qs.exists():
-        order = order_qs[0]
-        # check if the order item is in the order
-        if order.items.filter(item__slug=item.slug).exists():
-            order_item = OrderItem.objects.filter(
-                item=item,
-                user=request.user,
-                ordered=False
-            )[0]
-            order.items.remove(order_item)
-            order_item.delete()
-            messages.info(request, "This item was removed from your cart.")
-            return redirect("core:order-summary")
+    try:
+        # Get item from MySQL database using slug instead of category
+        item = get_object_or_404(Item.objects.using('item_db'), slug=slug)
+        
+        # Get Order from Oracle database
+        order_qs = Order.objects.using('other_db').filter(
+            user=request.user,
+            ordered=False
+        )
+        
+        if order_qs.exists():
+            order = order_qs[0]
+            
+            # Check if the order item exists using raw SQL
+            with connections['other_db'].cursor() as cursor:
+                cursor.execute("""
+                    SELECT oi.ID 
+                    FROM CORE_ORDERITEM oi
+                    INNER JOIN CORE_ORDER_ITEMS coi ON oi.ID = coi.ORDERITEM_ID
+                    WHERE coi.ORDER_ID = %s 
+                    AND oi.ITEM_ID = %s
+                    AND oi.ORDERED = 0
+                """, [order.id, item.id])
+                
+                order_item = cursor.fetchone()
+                
+                if order_item:
+                    order_item_id = order_item[0]
+                    
+                    # First remove from CORE_ORDER_ITEMS
+                    cursor.execute("""
+                        DELETE FROM CORE_ORDER_ITEMS 
+                        WHERE ORDER_ID = %s AND ORDERITEM_ID = %s
+                    """, [order.id, order_item_id])
+                    
+                    # Then delete the OrderItem
+                    cursor.execute("""
+                        DELETE FROM CORE_ORDERITEM 
+                        WHERE ID = %s
+                    """, [order_item_id])
+                    
+                    messages.info(request, "Item removed from your cart.")
+                    return redirect("core:order-summary")
+                else:
+                    messages.warning(request, "This item was not in your cart")
+                    return redirect("core:home")
         else:
-            messages.info(request, "This item was not in your cart")
-            return redirect("core:product", slug=slug)
-    else:
-        messages.info(request, "You do not have an active order")
-        return redirect("core:product", slug=slug)
+            messages.warning(request, "You do not have an active order")
+            return redirect("core:home")
+            
+    except Exception as e:
+        messages.error(request, f"Error removing item: {str(e)}")
+        return redirect("core:home")
 
 
 @login_required
 def remove_single_item_from_cart(request, slug):
-    item = get_object_or_404(Item, slug=slug)
-    order_qs = Order.objects.filter(
-        user=request.user,
+    # Get item from MySQL database
+    item = get_object_or_404(Item.objects.using('item_db'), slug=slug)
+    
+    # Get Order from Oracle database
+    order_qs = Order.objects.using('other_db').filter(
+        user=request.user, 
         ordered=False
     )
+    
     if order_qs.exists():
         order = order_qs[0]
-        # check if the order item is in the order
-        if order.items.filter(item__slug=item.slug).exists():
-            order_item = OrderItem.objects.filter(
-                item=item,
-                user=request.user,
-                ordered=False
-            )[0]
-            if order_item.quantity > 1:
-                order_item.quantity -= 1
-                order_item.save()
+        
+        # Use raw SQL to check if item exists in order
+        with connections['other_db'].cursor() as cursor:
+            cursor.execute("""
+                SELECT oitem.ID, oitem.QUANTITY 
+                FROM CORE_ORDER_ITEMS oi
+                JOIN CORE_ORDERITEM oitem ON oi.ORDERITEM_ID = oitem.ID
+                WHERE oi.ORDER_ID = %s 
+                AND oitem.ITEM_ID = %s
+                AND oitem.ORDERED = 0
+                """, [order.id, item.id])
+            result = cursor.fetchone()
+            
+        if result:
+            order_item_id, quantity = result
+            if quantity > 1:
+                # Update quantity
+                with connections['other_db'].cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE CORE_ORDERITEM 
+                        SET QUANTITY = QUANTITY - 1 
+                        WHERE ID = %s
+                        """, [order_item_id])
+                messages.info(request, "This item quantity was updated.")
             else:
-                order.items.remove(order_item)
-            messages.info(request, "This item quantity was updated.")
+                # Remove the order-item relationship and the order item
+                with connections['other_db'].cursor() as cursor:
+                    cursor.execute("""
+                        DELETE FROM CORE_ORDER_ITEMS 
+                        WHERE ORDER_ID = %s AND ORDERITEM_ID = %s
+                        """, [order.id, order_item_id])
+                    cursor.execute("""
+                        DELETE FROM CORE_ORDERITEM 
+                        WHERE ID = %s
+                        """, [order_item_id])
+                messages.info(request, "This item was removed from your cart.")
             return redirect("core:order-summary")
         else:
-            messages.info(request, "This item was not in your cart")
+            messages.info(request, "This item was not in your cart.")
             return redirect("core:product", slug=slug)
     else:
-        messages.info(request, "You do not have an active order")
+        messages.info(request, "You do not have an active order.")
         return redirect("core:product", slug=slug)
 
 
@@ -501,15 +628,25 @@ class AddCouponView(View):
         if form.is_valid():
             try:
                 code = form.cleaned_data.get('code')
-                order = Order.objects.get(
-                    user=self.request.user, ordered=False)
-                order.coupon = get_coupon(self.request, code)
-                order.save()
-                messages.success(self.request, "Successfully added coupon")
+                order = Order.objects.using('other_db').get(
+                    user=self.request.user, 
+                    ordered=False
+                )
+                try:
+                    coupon = Coupon.objects.using('other_db').get(code=code)
+                    order.coupon = coupon
+                    order.save(using='other_db')
+                    messages.success(self.request, "Successfully added coupon")
+                    return redirect("core:checkout")
+                except Coupon.DoesNotExist:
+                    messages.warning(self.request, "This coupon does not exist")
+                    return redirect("core:checkout")
+            except Order.DoesNotExist:
+                messages.warning(self.request, "You do not have an active order")
                 return redirect("core:checkout")
-            except ObjectDoesNotExist:
-                messages.info(self.request, "You do not have an active order")
-                return redirect("core:checkout")
+        # if the form is not valid
+        messages.warning(self.request, "Invalid coupon code")
+        return redirect("core:checkout")
 
 
 class RequestRefundView(View):
