@@ -49,12 +49,19 @@ DATABASES = {
         'HOST': 'localhost',
         'PORT': '3306',
     },
+    # "other_db": {
+    #     'ENGINE': 'django.db.backends.oracle',
+    #     'NAME': 'localhost:1521/oracle',
+    #     'USER': 'Test',
+    #     'PASSWORD': 'test',
+    # },
     "other_db": {
-        'ENGINE': 'django.db.backends.oracle',
-        'NAME': 'localhost:1521/oracle',
-        'USER': 'Test',
-        'PASSWORD': 'test',
-        
+        'ENGINE': 'django.db.backends.postgresql_psycopg2',
+        'NAME': 'other_db_django',
+        'USER': 'postgres',
+        'PASSWORD': 'tienanh05',
+        'HOST': 'localhost',
+        'PORT': '5432',
     },
 }
 

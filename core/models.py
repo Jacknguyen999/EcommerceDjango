@@ -65,54 +65,69 @@ class Item(models.Model):
         })
     class Meta:
         app_label = 'core'
-   
-        
+
 
 
 # class OrderItem(models.Model):
-    # id = models.AutoField(primary_key=True, db_column='ID')
-    # user = models.ForeignKey(
-    #     settings.AUTH_USER_MODEL,
-    #     on_delete=models.CASCADE,
-    #     db_constraint=False,
-    #     db_column='USER_ID'
-    # )
-    # ordered = models.BooleanField(
-    #     default=False,
-    #     db_column='ORDERED'
-    # )
-    # item = models.ForeignKey(
-    #     Item,
-    #     on_delete=models.CASCADE,
-    #     db_constraint=False,
-    #     db_column='ITEM_ID'
-    # )
-    # quantity = models.IntegerField(
-    #     default=1,
-    #     db_column='QUANTITY'
-    # )
+#     id = models.AutoField(primary_key=True, db_column='ID')
+#     user = models.ForeignKey(
+#         settings.AUTH_USER_MODEL,
+#         on_delete=models.CASCADE,
+#         db_constraint=False,
+#         db_column='USER_ID'
+#     )
+#     ordered = models.BooleanField(default=False, db_column='ORDERED')
+#     item = models.ForeignKey(
+#         Item,
+#         on_delete=models.CASCADE,
+#         db_constraint=False,
+#         db_column='ITEM_ID'
+#     )
+#     quantity = models.IntegerField(default=1, db_column='QUANTITY')
 
-    # class Meta:
-    #     db_table = 'CORE_ORDERITEM'
-    #     managed = False
+#     class Meta:
+#         managed = False
+#         db_table = 'CORE_ORDERITEM'
 
-    # def __str__(self):
-    #     return f"{self.quantity} of {self.item.title}"
+#     def __str__(self):
+#         return f"{self.quantity} of {self.item.title}"
 
-    # def get_total_item_price(self):
-    #     return self.quantity * self.item.price
+#     def get_total_item_price(self):
+#         return Decimal(str(self.quantity)) * Decimal(str(self.item.price))
 
-    # def get_total_discount_item_price(self):
-    #     return self.quantity * self.item.discount_price
+#     def get_total_discount_item_price(self):
+#         return Decimal(str(self.quantity)) * Decimal(str(self.item.discount_price))
 
-    # def get_amount_saved(self):
-    #     return self.get_total_item_price() - self.get_total_discount_item_price()
+#     def get_amount_saved(self):
+#         return self.get_total_item_price() - self.get_total_discount_item_price()
 
-    # def get_final_price(self):
-    #     if self.item.discount_price:
-    #         return self.get_total_discount_item_price()
-    #     return self.get_total_item_price()
-  
+#     def get_final_price(self):
+#         if self.item.discount_price:
+#             return float(self.get_total_discount_item_price())
+#         return float(self.get_total_item_price())
+
+
+# class OrderItems(models.Model):
+#     id = models.AutoField(primary_key=True, db_column='ID')
+#     order = models.ForeignKey(
+#         'Order', 
+#         on_delete=models.CASCADE,
+#         db_constraint=False,
+#         db_column='ORDER_ID'
+#     )
+#     orderitem = models.ForeignKey(
+#         'OrderItem',
+#         on_delete=models.CASCADE,
+#         db_constraint=False,
+#         db_column='ORDERITEM_ID'
+#     )
+
+#     class Meta:
+#         managed = False
+#         db_table = 'CORE_ORDER_ITEMS'
+
+
+# ... existing code ...
 
 class OrderItem(models.Model):
     id = models.AutoField(primary_key=True, db_column='ID')
@@ -135,9 +150,6 @@ class OrderItem(models.Model):
         managed = False
         db_table = 'CORE_ORDERITEM'
 
-    def __str__(self):
-        return f"{self.quantity} of {self.item.title}"
-
     def get_total_item_price(self):
         return Decimal(str(self.quantity)) * Decimal(str(self.item.price))
 
@@ -151,7 +163,6 @@ class OrderItem(models.Model):
         if self.item.discount_price:
             return float(self.get_total_discount_item_price())
         return float(self.get_total_item_price())
-
 
 class OrderItems(models.Model):
     id = models.AutoField(primary_key=True, db_column='ID')
@@ -172,9 +183,11 @@ class OrderItems(models.Model):
         managed = False
         db_table = 'CORE_ORDER_ITEMS'
 
+# Update SQL queries to match the uppercase column names:
+
 
 class Order(models.Model):
-    id = models.AutoField(primary_key=True)
+    id = models.AutoField(primary_key=True, db_column='ID')
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -184,7 +197,7 @@ class Order(models.Model):
     ref_code = models.CharField(max_length=20, blank=True, null=True, db_column='REF_CODE')
     items = models.ManyToManyField(
         OrderItem,
-        through=OrderItems,
+        through='OrderItems',
         through_fields=('order', 'orderitem')
     )
     start_date = models.DateTimeField(auto_now_add=True, db_column='START_DATE')
@@ -262,11 +275,11 @@ class Payment(models.Model):
     stripe_charge_id = models.CharField(max_length=50, db_column='STRIPE_CHARGE_ID')
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL, 
-        blank=True, 
+        on_delete=models.SET_NULL,
+        blank=True,
         null=True,
-        db_column='USER_ID',
-        db_constraint=False
+        db_constraint=False,
+        db_column='USER_ID'
     )
     amount = models.FloatField(db_column='AMOUNT')
     timestamp = models.DateTimeField(auto_now_add=True, db_column='TIMESTAMP')
@@ -282,7 +295,7 @@ class Payment(models.Model):
 class Coupon(models.Model):
     id = models.AutoField(primary_key=True, db_column='ID')
     code = models.CharField(max_length=15, db_column='CODE')
-    amount = models.DecimalField(max_digits=10, decimal_places=2, db_column='AMOUNT')
+    amount = models.FloatField(db_column='AMOUNT')
 
     class Meta:
         managed = False
